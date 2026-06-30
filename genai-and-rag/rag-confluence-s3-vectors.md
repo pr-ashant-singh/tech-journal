@@ -49,12 +49,12 @@ At query time, the path from question to grounded answer takes ~1 second:
 ```
 User Query ──→ Query Embedding ──→ S3 Vectors Search ──→ Top-K Chunks ──→ LLM ──→ Answer
                (BGE-large,          (cosine similarity)   (k=5)           (Bedrock
-                query prefix)                                              Claude 3 Haiku)
+                query prefix)                                              Claude 4.5 Haiku)
 ```
 
 1. **Embed query** — Encode the user's question with the `"Represent this question: "` prefix (asymmetric encoding improves recall over symmetric approaches).
 2. **Vector search** — Query S3 Vectors for the top-5 most similar chunks using cosine distance. Metadata filters can narrow results by content type or Confluence space.
-3. **Generate** — Pass retrieved chunks as context to Claude 3 Haiku via Amazon Bedrock. The prompt instructs the model to answer only from the provided context and cite sources.
+3. **Generate** — Pass retrieved chunks as context to Claude 4.5 Haiku via Amazon Bedrock. The prompt instructs the model to answer only from the provided context and cite sources.
 4. **Return** — The response includes the generated answer plus source citations (page title, URL, section heading) so engineers can verify and dig deeper.
 
 ### Why This Separation Matters
@@ -317,7 +317,7 @@ async def ask_question(query: str):
     
     # 4. Generate answer with Claude (via Bedrock)
     answer = bedrock.invoke_model(
-        modelId="anthropic.claude-3-haiku",
+        modelId="anthropic.claude-haiku-4-5",
         body={
             "prompt": f"Based on this context:\n{context}\n\nAnswer: {query}",
             "max_tokens": 500,
@@ -336,6 +336,23 @@ async def ask_question(query: str):
 - **Latency:** Sub-second responses (embedding + vector search + LLM generation)
 - **Cost:** Minimal — S3 Vectors is serverless, BGE runs locally, only LLM calls cost money
 - **Maintenance:** Confluence pages get re-indexed on update (webhook trigger)
+
+---
+
+## Cost Breakdown
+
+For ~500 Confluence pages, ~3,000 chunks, and ~200 queries/day:
+
+| Component | Monthly Cost |
+|-----------|-------------|
+| BGE-large embeddings (self-hosted) | $0 |
+| LLaVA diagram descriptions (self-hosted) | $0 |
+| S3 Vectors (storage + queries) | ~$2 |
+| Bedrock Claude 4.5 Haiku (~6K calls) | ~$12 |
+| FastAPI on ECS Fargate (0.25 vCPU) | ~$15 |
+| **Total** | **~$29/month** |
+
+A comparable managed stack (OpenAI embeddings + Pinecone + GPT-4o) would run $150–300/month. Self-hosting the embedding and vision models, combined with serverless vector storage, keeps this an order of magnitude cheaper.
 
 ---
 
@@ -368,7 +385,7 @@ async def ask_question(query: str):
 - **Embeddings:** BAAI/bge-large-en-v1.5 (sentence-transformers)
 - **Vector Store:** AWS S3 Vectors (cosine, 1024-dim, float32)
 - **Serving:** FastAPI + Uvicorn
-- **LLM:** Amazon Bedrock (Claude 3 Haiku)
+- **LLM:** Amazon Bedrock (Claude 4.5 Haiku)
 - **Infra:** AWS CDK, S3, IAM
 
 ---
