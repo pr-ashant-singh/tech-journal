@@ -25,32 +25,43 @@ Get: A grounded answer with citations to the exact Confluence page and section.
 
 ## Architecture Overview
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        INGESTION PIPELINE                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  Confluence API ──→ HTML Parser ──→ Smart Chunker ──→ Embedder  │
-│                        │                  │              │        │
-│                   BeautifulSoup    Text/Tables/Images   BGE-large │
-│                                   (LLaVA for diagrams)  (1024d)  │
-│                                                          │        │
-│                                                    S3 Vectors     │
-│                                                   (cosine index)  │
-└─────────────────────────────────────────────────────────────────┘
+The system is split into two decoupled pipelines — **ingestion** (batch, offline) and **retrieval + generation** (real-time, per-query). This separation lets us re-index Confluence content independently of serving, and scale each pipeline on its own terms.
 
-┌─────────────────────────────────────────────────────────────────┐
-│                        RETRIEVAL + GENERATION                    │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  User Query ──→ Query Embedding ──→ S3 Vectors Search ──→ Top K  │
-│                    (BGE-large)          (cosine)          chunks  │
-│                                                             │     │
-│                                              LLM (Bedrock Claude) │
-│                                                             │     │
-│                                                    Grounded Answer │
-└─────────────────────────────────────────────────────────────────┘
+### Ingestion Pipeline
+
+Confluence pages flow through four stages before becoming searchable vectors:
+
 ```
+Confluence API ──→ HTML Parser ──→ Smart Chunker ──→ Embedder ──→ S3 Vectors
+                   (BeautifulSoup)   (text/tables/    (BGE-large,   (cosine index,
+                                      diagrams)        1024-dim)     float32)
+```
+
+1. **Fetch** — Pull raw HTML (`body.storage`) from Confluence Cloud via REST API, including page metadata and image attachments.
+2. **Parse** — Strip Confluence macros and extract clean content using BeautifulSoup, preserving heading hierarchy.
+3. **Chunk** — Split content by type: text sections respect heading boundaries (800 chars, 100 overlap), tables convert to structured key-value format, and diagrams pass through LLaVA (13B, local via Ollama) to produce text descriptions.
+4. **Embed & Store** — Each chunk gets encoded with BGE-large-en-v1.5 using the document prefix, normalized, and written to an S3 Vectors index with metadata (page title, URL, heading, content type).
+
+### Retrieval + Generation Pipeline
+
+At query time, the path from question to grounded answer takes ~1 second:
+
+```
+User Query ──→ Query Embedding ──→ S3 Vectors Search ──→ Top-K Chunks ──→ LLM ──→ Answer
+               (BGE-large,          (cosine similarity)   (k=5)           (Bedrock
+                query prefix)                                              Claude 3 Haiku)
+```
+
+1. **Embed query** — Encode the user's question with the `"Represent this question: "` prefix (asymmetric encoding improves recall over symmetric approaches).
+2. **Vector search** — Query S3 Vectors for the top-5 most similar chunks using cosine distance. Metadata filters can narrow results by content type or Confluence space.
+3. **Generate** — Pass retrieved chunks as context to Claude 3 Haiku via Amazon Bedrock. The prompt instructs the model to answer only from the provided context and cite sources.
+4. **Return** — The response includes the generated answer plus source citations (page title, URL, section heading) so engineers can verify and dig deeper.
+
+### Why This Separation Matters
+
+- **Ingestion is batch and fault-tolerant** — a failed page doesn't block the rest; re-runs are idempotent (keyed by page ID + chunk index).
+- **Retrieval is stateless** — the FastAPI serving layer holds no state beyond the embedding model in memory. Horizontal scaling is trivial.
+- **Each component is independently replaceable** — swap the embedding model, change the vector store, or switch the LLM without touching the other pieces.
 
 ---
 
